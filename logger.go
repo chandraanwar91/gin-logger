@@ -3,10 +3,12 @@ package logger
 import (
 	"bytes"
 	"encoding/json"
+	"flag"
 	"io"
 	"net/http"
 	"os"
 	"regexp"
+	"strconv"
 	"time"
 
 	"io/ioutil"
@@ -25,11 +27,12 @@ const (
 type Config struct {
 	Logger *zerolog.Logger
 	// UTC a boolean stating whether to use UTC time zone or local.
-	UTC            bool
-	SkipPath       []string
-	SkipPathRegexp *regexp.Regexp
-	Format         string
-	Output         io.Writer
+	UTC                    bool
+	SkipPath               []string
+	SkipPathRegexp         *regexp.Regexp
+	Format                 string
+	Output                 io.Writer
+	SkipLoggedPathResponse []string
 }
 
 var (
@@ -44,8 +47,25 @@ var (
 	}
 )
 
+type bodyLogWriter struct {
+	gin.ResponseWriter
+	body *bytes.Buffer
+}
+
+func (w bodyLogWriter) Write(b []byte) (int, error) {
+	w.body.Write(b)
+	return w.ResponseWriter.Write(b)
+}
+
 // SetLogger initializes the logging middleware.
 func SetLogger(config ...Config) gin.HandlerFunc {
+
+	flag.Parse()
+	zerolog.SetGlobalLevel(zerolog.InfoLevel)
+	if gin.IsDebugging() {
+		zerolog.SetGlobalLevel(zerolog.DebugLevel)
+	}
+
 	var newConfig Config
 	if len(config) > 0 {
 		newConfig = config[0]
@@ -58,6 +78,21 @@ func SetLogger(config ...Config) gin.HandlerFunc {
 		}
 	}
 
+	var skipLoggedPathResponse map[string]struct{}
+	if length := len(newConfig.SkipLoggedPathResponse); length > 0 {
+		skipLoggedPathResponse = make(map[string]struct{}, length)
+		for _, path := range newConfig.SkipLoggedPathResponse {
+			skipLoggedPathResponse[path] = struct{}{}
+		}
+	}
+
+	// log.Logger = log.Output(
+	// 	zerolog.ConsoleWriter{
+	// 		Out:     os.Stdout,
+	// 		NoColor: false,
+	// 	},
+	// )
+
 	if newConfig.Format == "" {
 		newConfig.Format = DefaultLoggerConfig.Format
 	}
@@ -65,6 +100,8 @@ func SetLogger(config ...Config) gin.HandlerFunc {
 	if newConfig.Output == nil {
 		newConfig.Output = DefaultLoggerConfig.Output
 	}
+
+	newConfig.UTC = DefaultLoggerConfig.UTC
 
 	var sublog zerolog.Logger
 	if newConfig.Logger == nil {
@@ -74,6 +111,8 @@ func SetLogger(config ...Config) gin.HandlerFunc {
 	}
 
 	return func(c *gin.Context) {
+
+		timestamp := strconv.Itoa(int(time.Now().Unix()))
 		start := time.Now()
 		path := c.Request.URL.Path
 		raw := c.Request.URL.RawQuery
@@ -81,7 +120,6 @@ func SetLogger(config ...Config) gin.HandlerFunc {
 			path = path + "?" + raw
 		}
 
-		c.Next()
 		track := true
 
 		if _, ok := skip[path]; ok {
@@ -95,6 +133,20 @@ func SetLogger(config ...Config) gin.HandlerFunc {
 		}
 
 		if track {
+			var responseBody bytes.Buffer
+
+			// Take req body and add again to request context
+			// Because can only read json once
+			body, _ := c.GetRawData()
+
+			blw := &bodyLogWriter{body: bytes.NewBufferString(""), ResponseWriter: c.Writer}
+			c.Writer = blw
+
+			rdr := ioutil.NopCloser(bytes.NewBuffer(body))
+			c.Request.Body = rdr
+
+			c.Next()
+
 			hostname, err := os.Hostname()
 			if err != nil {
 				hostname = "unknown"
@@ -110,34 +162,52 @@ func SetLogger(config ...Config) gin.HandlerFunc {
 			if len(c.Errors) > 0 {
 				msg = c.Errors.String()
 			}
+
+			// Create new json body with removed unnecesarry character
+			// eg: \n \r etc
+			bodyBuffer := new(bytes.Buffer)
+			if len(body) > 0 {
+				if err := json.Compact(bodyBuffer, body); err != nil {
+					msg = c.Errors.String()
+				}
+			}
+
+			compactBody := bodyBuffer.Bytes()
+			if len(compactBody) == 0 {
+				compactBody = []byte("null")
+			}
+
+			if _, ok := skipLoggedPathResponse[path]; !ok || c.Writer.Status() >= http.StatusBadRequest {
+				responseBody = *blw.body
+			}
+
 			reqID := CxtRequestID(c)
 			reqMethod := c.Request.Method
 			reqURI := c.Request.RequestURI
 			statusCode := c.Writer.Status()
 			clientIP := c.ClientIP()
 			clientUserAgent := c.Request.UserAgent()
-			postParams, _ := ioutil.ReadAll(c.Request.Body)
 			referer := c.Request.Referer()
 			dataLength := c.Writer.Size()
 			if dataLength < 0 {
 				dataLength = 0
 			}
-			c.Request.Body = ioutil.NopCloser(bytes.NewReader(postParams))
 
 			dumplogger := sublog.With().
+				Str("timestamp", timestamp).
 				Str("requestID", reqID).
 				Str("host", hostname).
 				Str("header", GetAllHeaders(c)).
 				Str("uri", reqURI).
 				Int("status", statusCode).
 				Str("method", reqMethod).
-				Str("post-param", string(postParams)).
 				Str("path", path).
 				Str("ip", clientIP).
-				Str("post-param", string(postParams)).
 				Dur("latency", latency).
 				Str("user-agent", clientUserAgent).
 				Str("referer", referer).
+				RawJSON("body", compactBody).
+				RawJSON("responseBody", responseBody.Bytes()).
 				Logger()
 
 			switch {
